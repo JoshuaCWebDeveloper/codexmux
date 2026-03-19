@@ -1,0 +1,704 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="${CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
+ACTIVE_SECS="${CODEX_ACTIVE_SECS:-120}"
+REFRESH_SECS="${CODEX_REFRESH_SECS:-2}"
+MAX_TAILS="${CODEX_MAX_TAILS:-8}"
+STATS_WIDTH="${CODEX_STATS_WIDTH:-50%}"
+STATS_FROZEN_LINES="${CODEX_STATS_FROZEN_LINES:-3}"
+TMUX_NAME="${CODEX_TMUX_NAME:-codexmux}"
+DASHBOARD_WINDOW="${CODEX_DASHBOARD_WINDOW:-dashboard}"
+CTL_WINDOW="${CODEX_CTL_WINDOW:-_ctl}"
+
+SCRIPT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
+
+_dashboard_target() {
+  printf '%s:%s' "$TMUX_NAME" "$DASHBOARD_WINDOW"
+}
+
+_find_logs() {
+  [[ -d "$ROOT" ]] || return 0
+  find "$ROOT" -type f -name 'rollout-*.jsonl' -print0 2>/dev/null \
+    | xargs -0 ls -1t 2>/dev/null || true
+}
+
+_age_secs() {
+  local f="$1"
+  local mtime now
+  mtime="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")"
+  now="$(date +%s)"
+  echo $(( now - mtime ))
+}
+
+_h_age() {
+  local age="$1"
+  if (( age < 60 )); then
+    echo "${age}s"
+  elif (( age < 3600 )); then
+    echo "$((age / 60))m"
+  else
+    echo "$((age / 3600))h"
+  fi
+}
+
+_relpath() {
+  local f="$1"
+  if [[ "$f" == "$ROOT/"* ]]; then
+    echo "${f#$ROOT/}"
+  else
+    echo "$f"
+  fi
+}
+
+_shell_command() {
+  local cmd=""
+  local arg
+  for arg in "$@"; do
+    if [[ -n "$cmd" ]]; then
+      cmd+=" "
+    fi
+    cmd+="$(printf '%q' "$arg")"
+  done
+  printf '%s' "$cmd"
+}
+
+_paint() {
+  local buf="$1"
+  printf '\033[H'
+  printf '\033[J'
+  printf '%s' "$buf"
+}
+
+_scroll_buf() {
+  local offset_x="${1:-0}"
+  local offset_y="${2:-0}"
+  local frozen_lines="${3:-0}"
+  local max_lines="${4:-0}"
+  local buf="${5:-}"
+  local line out=""
+  local idx=0
+  local body_idx=0
+  local rendered=0
+  (( offset_x < 0 )) && offset_x=0
+  (( offset_y < 0 )) && offset_y=0
+  (( frozen_lines < 0 )) && frozen_lines=0
+  (( max_lines < 0 )) && max_lines=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if (( max_lines > 0 && rendered >= max_lines )); then
+      break
+    fi
+    if (( idx < frozen_lines )); then
+      out+="${line:offset_x}"$'\n'
+      ((idx++))
+      ((rendered++))
+      continue
+    fi
+    if (( body_idx < offset_y )); then
+      ((idx++))
+      ((body_idx++))
+      continue
+    fi
+    out+="${line:offset_x}"$'\n'
+    ((idx++))
+    ((body_idx++))
+    ((rendered++))
+  done <<< "$buf"
+
+  printf '%s' "$out"
+}
+
+_line_count() {
+  local buf="${1:-}"
+  local count=0 line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((count++))
+  done <<< "$buf"
+  printf '%s' "$count"
+}
+
+_max_line_width() {
+  local buf="${1:-}"
+  local max=0 line len
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    len=${#line}
+    if (( len > max )); then
+      max=$len
+    fi
+  done <<< "$buf"
+  printf '%s' "$max"
+}
+
+_read_escape_sequence() {
+  local seq="" ch="" i
+  for ((i = 0; i < 8; i++)); do
+    if read -rsn1 -t 0.1 ch; then
+      seq+="$ch"
+      case "$ch" in
+        A|B|C|D|H|F|~)
+          break
+          ;;
+      esac
+    else
+      break
+    fi
+  done
+  printf '%s' "$seq"
+}
+
+_apply_layout() {
+  local dashboard stats_pane
+  dashboard="$(_dashboard_target)"
+  stats_pane="$(_resolve_stats_pane)"
+  [[ -n "$stats_pane" ]] || return 0
+
+  tmux set-window-option -q -t "$dashboard" main-pane-width "$STATS_WIDTH" >/dev/null 2>&1 || true
+  tmux select-pane -t "$stats_pane" >/dev/null 2>&1 || true
+  tmux select-layout -t "$dashboard" main-vertical >/dev/null 2>&1 || true
+  tmux select-pane -t "$stats_pane" >/dev/null 2>&1 || true
+}
+
+_token_triplet() {
+  local f="$1"
+  jq -rs '
+    def num:
+      if type == "number" then .
+      elif type == "string" then (tonumber? // 0)
+      else 0
+      end;
+
+    [
+      .[]
+      | select(.type == "event_msg")
+      | .payload?
+      | select(type == "object" and .type == "token_count")
+      | .info?.total_token_usage?
+      | select(type == "object")
+    ] as $tc
+
+    | if ($tc | length) > 0 then
+        ($tc[-1]) as $u
+        | "\(($u.input_tokens // 0) | num)/\(($u.output_tokens // 0) | num)/\((($u.total_tokens // 0) | num))"
+      else
+        [ .[] | .. | objects | .usage? | select(type == "object") ] as $us
+        | ($us | map((.input_tokens? // 0) | num) | add // 0) as $in
+        | ($us | map((.output_tokens? // 0) | num) | add // 0) as $out
+        | ($us | map((.total_tokens? // 0) | num) | add // 0) as $tot
+        | if $tot > 0 then
+            "\($in)/\($out)/\($tot)"
+          else
+            "\($in)/\($out)/\($in + $out)"
+          end
+      end
+  ' "$f" 2>/dev/null || echo "0/0/0"
+}
+
+_last_summary() {
+  local f="$1"
+  tail -n 1 "$f" \
+    | jq -r '
+        def pieces(xs): xs | map(select(. != "" and . != null)) | join(" ");
+        if type != "object" then
+          "non-json"
+        elif .type == "response_item" then
+          pieces([
+            .type,
+            .payload?.type,
+            .payload?.name,
+            .payload?.call_id,
+            .payload?.role
+          ])
+        elif .type == "event_msg" then
+          pieces([
+            .type,
+            .payload?.type,
+            .payload?.message
+          ])
+        else
+          pieces([
+            .type,
+            .payload?.type,
+            .payload?.status,
+            .payload?.name,
+            .payload?.error
+          ])
+        end
+      ' 2>/dev/null || echo "non-json"
+}
+
+_stat_line() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+
+  local age state tok in_tok out_tok total_tok last
+  age="$(_age_secs "$f")"
+  state="stopped"
+  if (( age <= ACTIVE_SECS )); then
+    state="active"
+  fi
+
+  tok="$(_token_triplet "$f")"
+  IFS='/' read -r in_tok out_tok total_tok <<< "$tok"
+  last="$(_last_summary "$f")"
+
+  printf "%-7s %-4s %12s %12s %12s %-28.28s %s\n" \
+    "$state" \
+    "$(_h_age "$age")" \
+    "$in_tok" \
+    "$out_tok" \
+    "$total_tok" \
+    "$last" \
+    "$(_relpath "$f")"
+}
+
+_stats_pane_id() {
+  tmux show-option -v -t "$(_dashboard_target)" @codexmux_stats_pane 2>/dev/null || true
+}
+
+_record_stats_pane() {
+  local pane_id="$1"
+  tmux set-option -q -t "$(_dashboard_target)" @codexmux_stats_pane "$pane_id"
+}
+
+_resolve_stats_pane() {
+  local dashboard pane_id
+  dashboard="$(_dashboard_target)"
+  pane_id="$(_stats_pane_id)"
+
+  if [[ -n "$pane_id" ]] && tmux display-message -p -t "$pane_id" '#{pane_id}' >/dev/null 2>&1; then
+    printf '%s' "$pane_id"
+    return 0
+  fi
+
+  pane_id="$(tmux list-panes -t "$dashboard" -F '#{pane_id}' 2>/dev/null | head -n 1)"
+  if [[ -n "$pane_id" ]]; then
+    _record_stats_pane "$pane_id"
+    printf '%s' "$pane_id"
+  fi
+}
+
+_kill_mux_session() {
+  tmux kill-session -t "$TMUX_NAME" >/dev/null 2>&1 || true
+}
+
+_window_option() {
+  local key="$1"
+  local default="${2:-0}"
+  local value
+  value="$(tmux show-options -v -t "$(_dashboard_target)" "$key" 2>/dev/null || true)"
+  if [[ -n "$value" ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$default"
+  fi
+}
+
+_set_window_option() {
+  local key="$1"
+  local value="$2"
+  tmux set-option -q -t "$(_dashboard_target)" "$key" "$value"
+}
+
+_runtime_dir() {
+  local dir
+  if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+    dir="${XDG_RUNTIME_DIR%/}/codexmux"
+  else
+    dir="${HOME}/.cache/codexmux"
+  fi
+  mkdir -p "$dir"
+  chmod 700 "$dir" 2>/dev/null || true
+  printf '%s' "$dir"
+}
+
+_ensure_scroll_state() {
+  _set_window_option @codexmux_x_offset "$(_window_option @codexmux_x_offset 0)"
+  _set_window_option @codexmux_y_offset "$(_window_option @codexmux_y_offset 0)"
+}
+
+_reset_scroll_state() {
+  _set_window_option @codexmux_x_offset 0
+  _set_window_option @codexmux_y_offset 0
+}
+
+_install_tmux_bindings() {
+  local session_name
+  local cond
+  session_name="$TMUX_NAME"
+  cond="#{==:#{session_name},$session_name}"
+
+  tmux bind-key -n Left if-shell -F "$cond" \
+    "run-shell '$(_shell_command "$SCRIPT" --scroll x -8)'" "send-keys Left"
+  tmux bind-key -n Right if-shell -F "$cond" \
+    "run-shell '$(_shell_command "$SCRIPT" --scroll x 8)'" "send-keys Right"
+  tmux bind-key -n Up if-shell -F "$cond" \
+    "run-shell '$(_shell_command "$SCRIPT" --scroll y -1)'" "send-keys Up"
+  tmux bind-key -n Down if-shell -F "$cond" \
+    "run-shell '$(_shell_command "$SCRIPT" --scroll y 1)'" "send-keys Down"
+  tmux bind-key -n h if-shell -F "$cond" \
+    "run-shell '$(_shell_command "$SCRIPT" --scroll x -8)'" "send-keys h"
+  tmux bind-key -n l if-shell -F "$cond" \
+    "run-shell '$(_shell_command "$SCRIPT" --scroll x 8)'" "send-keys l"
+  tmux bind-key -n k if-shell -F "$cond" \
+    "run-shell '$(_shell_command "$SCRIPT" --scroll y -1)'" "send-keys k"
+  tmux bind-key -n j if-shell -F "$cond" \
+    "run-shell '$(_shell_command "$SCRIPT" --scroll y 1)'" "send-keys j"
+  tmux bind-key -n 0 if-shell -F "$cond" \
+    "run-shell '$(_shell_command "$SCRIPT" --scroll-home)'" "send-keys 0"
+}
+
+_ensure_dashboard() {
+  command -v tmux >/dev/null 2>&1 || { echo "tmux not installed. Try: sudo yum install -y tmux" >&2; exit 1; }
+
+  if ! tmux has-session -t "$TMUX_NAME" 2>/dev/null; then
+    tmux new-session -d -s "$TMUX_NAME" -n "$DASHBOARD_WINDOW" \
+      "$(_shell_command "$SCRIPT" --stats-loop)" >/dev/null
+    _reset_scroll_state
+  fi
+
+  if ! tmux list-windows -t "$TMUX_NAME" -F '#{window_name}' 2>/dev/null | grep -Fxq "$DASHBOARD_WINDOW"; then
+    tmux new-window -d -t "$TMUX_NAME" -n "$DASHBOARD_WINDOW" \
+      "$(_shell_command "$SCRIPT" --stats-loop)" >/dev/null
+    _reset_scroll_state
+  fi
+
+  local stats_pane
+  stats_pane="$(_resolve_stats_pane)"
+  _ensure_scroll_state
+  _install_tmux_bindings
+
+  if ! tmux list-windows -t "$TMUX_NAME" -F '#{window_name}' 2>/dev/null | grep -Fxq "$CTL_WINDOW"; then
+    tmux new-window -d -t "$TMUX_NAME" -n "$CTL_WINDOW" \
+      "$(_shell_command "$SCRIPT" --ctl)" >/dev/null
+  fi
+}
+
+cmd_stats() {
+  local files active_list=() stopped_list=()
+  files="$(_find_logs)"
+
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    if (( $(_age_secs "$f") <= ACTIVE_SECS )); then
+      active_list+=("$f")
+    else
+      stopped_list+=("$f")
+    fi
+  done <<< "$files"
+
+  {
+    echo "codexmux — $(date)"
+    echo "ROOT=$ROOT   active<=${ACTIVE_SECS}s   refresh=${REFRESH_SECS}s   max_tails=${MAX_TAILS}   x=$(_window_option @codexmux_x_offset 0) y=$(_window_option @codexmux_y_offset 0)"
+    echo
+    echo "Active sessions: ${#active_list[@]}"
+    echo "--------------------------------"
+    printf "%-7s %-4s %12s %12s %12s %-28s %s\n" "STATE" "AGE" "INPUT" "OUTPUT" "TOTAL" "LAST" "SESSION"
+    printf "%-7s %-4s %12s %12s %12s %-28s %s\n" "-------" "----" "------------" "------------" "------------" "----------------------------" "-------"
+    if (( ${#active_list[@]} == 0 )); then
+      echo "(none)"
+    else
+      for f in "${active_list[@]}"; do
+        _stat_line "$f"
+      done
+    fi
+    echo
+    echo "Stopped sessions: ${#stopped_list[@]}"
+    echo "--------------------------------"
+    printf "%-7s %-4s %12s %12s %12s %-28s %s\n" "STATE" "AGE" "INPUT" "OUTPUT" "TOTAL" "LAST" "SESSION"
+    printf "%-7s %-4s %12s %12s %12s %-28s %s\n" "-------" "----" "------------" "------------" "------------" "----------------------------" "-------"
+    if (( ${#stopped_list[@]} == 0 )); then
+      echo "(none)"
+    else
+      for f in "${stopped_list[@]}"; do
+        _stat_line "$f"
+      done
+    fi
+  }
+}
+
+cmd_tail() {
+  local f="${1:-}"
+  [[ -n "$f" && -f "$f" ]] || { echo "tail: missing file" >&2; exit 1; }
+  trap '_kill_mux_session' INT
+
+  echo "TAILING: $(_relpath "$f")"
+  echo "Active heuristic: mtime<=${ACTIVE_SECS}s"
+  echo "Ctrl-c stops this pane; Ctrl-b d detaches tmux."
+  echo
+
+  if command -v jq >/dev/null 2>&1; then
+    tail -n 80 -F "$f" | while IFS= read -r line; do
+      printf "%s\n" "$line" | jq -C . 2>/dev/null || printf "%s\n" "$line"
+    done
+  else
+    tail -n 80 -F "$f"
+  fi
+}
+
+cmd_placeholder() {
+  local prev="" out
+  trap '_kill_mux_session' INT
+  trap 'printf "\033[?7h"; tput cnorm 2>/dev/null || true' EXIT
+  tput civis 2>/dev/null || true
+  printf '\033[?7l'
+
+  while true; do
+    out=$(
+      printf 'No active sessions\n'
+      printf 'Watching for new session logs under %s\n\n' "$ROOT"
+      date
+      printf '\nrefresh=%ss active<=%ss\n' "$REFRESH_SECS" "$ACTIVE_SECS"
+    )
+    if [[ "$out" != "$prev" ]]; then
+      _paint "$out"
+      prev="$out"
+    fi
+    sleep "$REFRESH_SECS"
+  done
+}
+
+cmd_rebuild() {
+  command -v tmux >/dev/null 2>&1 || exit 0
+  _ensure_dashboard
+
+  local dashboard stats_pane cache prev active_key pane_count
+  local files
+  local -a active_ordered=()
+
+  dashboard="$(_dashboard_target)"
+  stats_pane="$(_resolve_stats_pane)"
+  cache="$(_runtime_dir)/${TMUX_NAME}.active"
+  files="$(_find_logs)"
+
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    if (( $(_age_secs "$f") <= ACTIVE_SECS )); then
+      active_ordered+=("$f")
+    fi
+  done <<< "$files"
+
+  if (( ${#active_ordered[@]} > MAX_TAILS )); then
+    active_ordered=( "${active_ordered[@]:0:MAX_TAILS}" )
+  fi
+
+  if (( ${#active_ordered[@]} == 0 )); then
+    active_key=""
+  else
+    active_key="$(printf '%s\n' "${active_ordered[@]}" | sort)"
+  fi
+
+  pane_count="$(tmux list-panes -t "$dashboard" -F '#{pane_id}' | wc -l | tr -d ' ')"
+
+  prev=""
+  [[ -f "$cache" ]] && prev="$(cat "$cache" || true)"
+  if [[ "$active_key" == "$prev" && "$pane_count" -gt 1 ]]; then
+    exit 0
+  fi
+  printf '%s' "$active_key" > "$cache"
+
+  local pane_id
+  while IFS= read -r pane_id; do
+    [[ -n "$pane_id" && "$pane_id" != "$stats_pane" ]] || continue
+    tmux kill-pane -t "$pane_id" >/dev/null 2>&1 || true
+  done < <(tmux list-panes -t "$dashboard" -F '#{pane_id}')
+
+  [[ -n "$stats_pane" ]] || exit 0
+  tmux select-pane -t "$stats_pane" >/dev/null 2>&1 || true
+
+  if (( ${#active_ordered[@]} == 0 )); then
+    tmux split-window -d -h -t "$stats_pane" \
+      "$(_shell_command "$SCRIPT" --placeholder)" >/dev/null
+  else
+    tmux split-window -d -h -t "$stats_pane" \
+      "$(_shell_command "$SCRIPT" --tail "${active_ordered[0]}")" >/dev/null
+
+    local i
+    for ((i = 1; i < ${#active_ordered[@]}; i++)); do
+      tmux split-window -d -t "$dashboard" \
+        "$(_shell_command "$SCRIPT" --tail "${active_ordered[$i]}")" >/dev/null
+    done
+  fi
+
+  _apply_layout
+}
+
+cmd_scroll() {
+  local axis="${1:-}"
+  local delta="${2:-0}"
+  local key current next
+
+  case "$axis" in
+    x) key='@codexmux_x_offset' ;;
+    y) key='@codexmux_y_offset' ;;
+    *) exit 1 ;;
+  esac
+
+  current="$(_window_option "$key" 0)"
+  [[ "$current" =~ ^-?[0-9]+$ ]] || current=0
+  [[ "$delta" =~ ^-?[0-9]+$ ]] || delta=0
+
+  next=$(( current + delta ))
+  if (( next < 0 )); then
+    next=0
+  fi
+  _set_window_option "$key" "$next"
+}
+
+cmd_scroll_home() {
+  _set_window_option @codexmux_x_offset 0
+  _set_window_option @codexmux_y_offset 0
+}
+
+cmd_ctl() {
+  trap '_kill_mux_session' INT
+  while true; do
+    "$SCRIPT" --rebuild || true
+    sleep "$REFRESH_SECS"
+  done
+}
+
+cmd_stats_loop() {
+  local prev="" out x_offset=0 y_offset=0 prev_x=-1 prev_y=-1 line_count max_y
+  local pane_lines pane_cols body_lines max_x max_width
+  local poll_secs="${CODEX_KEY_POLL_SECS:-0.1}"
+  local refresh_tick=0
+  local refresh_ticks=1
+  trap '_kill_mux_session' INT
+  trap 'printf "\033[?7h"; tput cnorm 2>/dev/null || true' EXIT
+  tput civis 2>/dev/null || true
+  printf '\033[?7l'
+
+  if [[ "$REFRESH_SECS" =~ ^[0-9]+$ ]] && (( REFRESH_SECS > 0 )); then
+    refresh_ticks=$(( REFRESH_SECS * 10 ))
+    (( refresh_ticks < 1 )) && refresh_ticks=1
+  fi
+
+  _reset_scroll_state
+  x_offset=0
+  y_offset=0
+  pane_lines="$(tput lines 2>/dev/null || echo 24)"
+  pane_cols="$(tput cols 2>/dev/null || echo 80)"
+  [[ "$pane_lines" =~ ^[0-9]+$ ]] || pane_lines=24
+  [[ "$pane_cols" =~ ^[0-9]+$ ]] || pane_cols=80
+  out="$("$SCRIPT" --stats || true)"
+  line_count="$(_line_count "$out")"
+  body_lines=$(( pane_lines - STATS_FROZEN_LINES ))
+  if (( body_lines < 1 )); then
+    body_lines=1
+  fi
+  max_y=$(( line_count - STATS_FROZEN_LINES - body_lines ))
+  if (( max_y < 0 )); then
+    max_y=0
+  fi
+  max_width="$(_max_line_width "$out")"
+  max_x=$(( max_width - pane_cols ))
+  if (( max_x < 0 )); then
+    max_x=0
+  fi
+  _paint "$(_scroll_buf "$x_offset" "$y_offset" "$STATS_FROZEN_LINES" "$pane_lines" "$out")"
+  prev="$out"
+  prev_x="$x_offset"
+  prev_y="$y_offset"
+
+  while true; do
+    sleep "$poll_secs"
+    x_offset="$(_window_option @codexmux_x_offset 0)"
+    y_offset="$(_window_option @codexmux_y_offset 0)"
+    [[ "$x_offset" =~ ^-?[0-9]+$ ]] || x_offset=0
+    [[ "$y_offset" =~ ^-?[0-9]+$ ]] || y_offset=0
+
+    pane_lines="$(tput lines 2>/dev/null || echo 24)"
+    pane_cols="$(tput cols 2>/dev/null || echo 80)"
+    [[ "$pane_lines" =~ ^[0-9]+$ ]] || pane_lines=24
+    [[ "$pane_cols" =~ ^[0-9]+$ ]] || pane_cols=80
+    body_lines=$(( pane_lines - STATS_FROZEN_LINES ))
+    if (( body_lines < 1 )); then
+      body_lines=1
+    fi
+    max_y=$(( line_count - STATS_FROZEN_LINES - body_lines ))
+    if (( max_y < 0 )); then
+      max_y=0
+    fi
+    max_width="$(_max_line_width "$prev")"
+    max_x=$(( max_width - pane_cols ))
+    if (( max_x < 0 )); then
+      max_x=0
+    fi
+    if (( x_offset > max_x )); then
+      x_offset=$max_x
+      _set_window_option @codexmux_x_offset "$x_offset"
+    fi
+    if (( y_offset > max_y )); then
+      y_offset=$max_y
+      _set_window_option @codexmux_y_offset "$y_offset"
+    fi
+
+    if (( x_offset != prev_x || y_offset != prev_y )); then
+      pane_lines="$(tput lines 2>/dev/null || echo 24)"
+      [[ "$pane_lines" =~ ^[0-9]+$ ]] || pane_lines=24
+      _paint "$(_scroll_buf "$x_offset" "$y_offset" "$STATS_FROZEN_LINES" "$pane_lines" "$prev")"
+      prev_x="$x_offset"
+      prev_y="$y_offset"
+    fi
+
+    refresh_tick=$(( refresh_tick + 1 ))
+    if (( refresh_tick < refresh_ticks )); then
+      continue
+    fi
+    refresh_tick=0
+
+    out="$("$SCRIPT" --stats || true)"
+    line_count="$(_line_count "$out")"
+    pane_lines="$(tput lines 2>/dev/null || echo 24)"
+    pane_cols="$(tput cols 2>/dev/null || echo 80)"
+    [[ "$pane_lines" =~ ^[0-9]+$ ]] || pane_lines=24
+    [[ "$pane_cols" =~ ^[0-9]+$ ]] || pane_cols=80
+    body_lines=$(( pane_lines - STATS_FROZEN_LINES ))
+    if (( body_lines < 1 )); then
+      body_lines=1
+    fi
+    max_y=$(( line_count - STATS_FROZEN_LINES - body_lines ))
+    if (( max_y < 0 )); then
+      max_y=0
+    fi
+    max_width="$(_max_line_width "$out")"
+    max_x=$(( max_width - pane_cols ))
+    if (( max_x < 0 )); then
+      max_x=0
+    fi
+    if (( x_offset > max_x )); then
+      x_offset=$max_x
+      _set_window_option @codexmux_x_offset "$x_offset"
+    fi
+    if (( y_offset > max_y )); then
+      y_offset=$max_y
+      _set_window_option @codexmux_y_offset "$y_offset"
+    fi
+    if [[ "$out" != "$prev" ]]; then
+      pane_lines="$(tput lines 2>/dev/null || echo 24)"
+      [[ "$pane_lines" =~ ^[0-9]+$ ]] || pane_lines=24
+      _paint "$(_scroll_buf "$x_offset" "$y_offset" "$STATS_FROZEN_LINES" "$pane_lines" "$out")"
+      prev="$out"
+      prev_x="$x_offset"
+      prev_y="$y_offset"
+    fi
+  done
+}
+
+case "${1:-}" in
+  --stats) shift; cmd_stats "$@"; exit 0 ;;
+  --tail) shift; cmd_tail "$@"; exit 0 ;;
+  --placeholder) shift; cmd_placeholder "$@"; exit 0 ;;
+  --rebuild) shift; cmd_rebuild "$@"; exit 0 ;;
+  --scroll) shift; cmd_scroll "$@"; exit 0 ;;
+  --scroll-home) shift; cmd_scroll_home "$@"; exit 0 ;;
+  --ctl) shift; cmd_ctl "$@"; exit 0 ;;
+  --stats-loop) shift; cmd_stats_loop "$@"; exit 0 ;;
+esac
+
+_ensure_dashboard
+"$SCRIPT" --rebuild || true
+_apply_layout
+tmux select-window -t "$(_dashboard_target)" >/dev/null 2>&1 || true
+tmux attach -t "$TMUX_NAME"
